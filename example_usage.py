@@ -8,7 +8,7 @@ import sys
 import os
 import requests
 import json
-from typing import List
+from typing import List, Optional
 
 # Add the app directory to the Python path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'app'))
@@ -22,7 +22,7 @@ class AgenticWorkflowClient:
         self.base_url = base_url
         self.session_id = None
     
-    def chat(self, message: str, flow_name: str = None) -> dict:
+    def chat(self, message: str, flow_name: Optional[str] = None) -> dict:
         """Send a chat message to the system"""
         
         # Create messages list

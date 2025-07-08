@@ -60,15 +60,15 @@ class GeneralQAFlow(BaseFlow):
         response = self.llm.invoke([HumanMessage(content=analysis_prompt)])
         analysis = response.content
         
-        state.metadata["question_analysis"] = analysis
-        state.current_step = "analyze_question"
+        state["metadata"]["question_analysis"] = analysis
+        state["current_step"] = "analyze_question"
         
         return state
     
     def _generate_response(self, state: FlowState) -> FlowState:
         """Generate a comprehensive response to the user's question"""
         user_message = self.get_last_user_message(state)
-        analysis = state.metadata.get("question_analysis", "")
+        analysis = state["metadata"].get("question_analysis", "")
         
         response_prompt = f"""
         Based on the following analysis and user question, provide a comprehensive and helpful response.
@@ -83,36 +83,35 @@ class GeneralQAFlow(BaseFlow):
         response = self.llm.invoke([HumanMessage(content=response_prompt)])
         response_content = response.content
         
-        state.metadata["generated_response"] = response_content
-        state.current_step = "generate_response"
+        state["metadata"]["generated_response"] = response_content
+        state["current_step"] = "generate_response"
         
         return state
     
     def _finalize_response(self, state: FlowState) -> FlowState:
         """Finalize and format the response"""
-        response_content = state.metadata.get("generated_response", "")
+        response_content = state["metadata"].get("generated_response", "")
         
         # Add the response to the conversation
         state = self.add_message(state, response_content, "assistant")
-        state.current_step = "finalize_response"
+        state["current_step"] = "finalize_response"
         
         return state
     
     def get_description(self) -> str:
         return """
-        General Question Answering Flow:
+        General QA Flow:
         
-        This flow handles general questions and provides comprehensive answers. It works by:
-        1. Analyzing the user's question to understand intent and requirements
-        2. Generating a detailed response based on the analysis
-        3. Finalizing and formatting the response for the user
+        This flow handles general questions and provides comprehensive, helpful responses.
         
-        Capabilities:
-        - Answer factual questions
-        - Provide explanations and tutorials
-        - Give opinions and recommendations
-        - Handle complex multi-part questions
-        - Acknowledge limitations when information is not available
+        Process:
+        1. Analyze the question type and intent
+        2. Generate a detailed response
+        3. Format and present the response
         
-        Use this flow for any general question that doesn't require specialized tools or workflows.
+        Features:
+        - Question type analysis
+        - Comprehensive response generation
+        - Context-aware answers
+        - Helpful explanations and suggestions
         """ 

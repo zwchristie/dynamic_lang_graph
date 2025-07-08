@@ -2,7 +2,7 @@ from typing import Dict, Any, List, Optional
 from langchain_openai import ChatOpenAI
 from langchain.schema import HumanMessage, SystemMessage
 from ..core.config import settings
-from ..flows.base import get_all_flows, get_flow_by_name, FlowState
+from ..flows.base import FLOW_REGISTRY, FlowState
 from ..models.schemas import Message, MessageRole
 import json
 
@@ -15,7 +15,11 @@ class OrchestratorService:
             temperature=0.7,
             api_key=settings.openai_api_key
         )
-        self.flows = get_all_flows()
+        self.flows = self._get_all_flows()
+    
+    def _get_all_flows(self) -> List[Any]:
+        """Get all registered flow instances"""
+        return [flow_class() for flow_class in FLOW_REGISTRY.values()]
     
     def get_available_flows_context(self) -> str:
         """Get formatted context of all available flows for LLM"""
@@ -78,7 +82,7 @@ class OrchestratorService:
     def execute_flow(self, flow_name: str, messages: List[Message], session_id: Optional[str] = None) -> Dict[str, Any]:
         """Execute a specific flow with the given messages"""
         
-        flow = get_flow_by_name(flow_name)
+        flow = self._get_flow_by_name(flow_name)
         if not flow:
             raise ValueError(f"Flow '{flow_name}' not found")
         
@@ -96,29 +100,37 @@ class OrchestratorService:
                 lc_messages.append(SystemMessage(content=msg.content))
         
         # Create initial state
-        state = FlowState(
-            messages=lc_messages,
-            session_id=session_id or "default",
-            current_step="start"
-        )
+        state: FlowState = {
+            "messages": lc_messages,
+            "session_id": session_id or "default",
+            "current_step": "start",
+            "metadata": {},
+            "error": None
+        }
         
         # Execute the flow
         result_state = flow.run(state)
         
         # Extract the last assistant message as response
         response_content = ""
-        for message in reversed(result_state.messages):
+        for message in reversed(result_state["messages"]):
             if hasattr(message, 'content'):
                 response_content = message.content
                 break
         
         return {
             "response": response_content,
-            "session_id": result_state.session_id,
+            "session_id": result_state["session_id"],
             "flow_name": flow_name,
-            "metadata": result_state.metadata,
-            "error": result_state.error
+            "metadata": result_state["metadata"],
+            "error": result_state["error"]
         }
+    
+    def _get_flow_by_name(self, name: str) -> Optional[Any]:
+        """Get a flow instance by name"""
+        if name in FLOW_REGISTRY:
+            return FLOW_REGISTRY[name]()
+        return None
     
     def process_chat_request(self, messages: List[Message], session_id: Optional[str] = None, specified_flow: Optional[str] = None) -> Dict[str, Any]:
         """Process a chat request by determining the appropriate flow and executing it"""

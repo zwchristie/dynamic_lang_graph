@@ -20,7 +20,7 @@ def test_imports():
         from app.models.schemas import ChatRequest, Message, MessageRole
         print("✓ Schemas imported successfully")
         
-        from app.flows.base import get_all_flows, get_flow_by_name
+        from app.flows.base import FLOW_REGISTRY, get_all_flows, get_flow_by_name
         print("✓ Flow base imported successfully")
         
         from app.flows.general_qa import GeneralQAFlow

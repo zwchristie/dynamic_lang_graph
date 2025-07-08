@@ -103,24 +103,24 @@ class TextToSQLFlow(BaseFlow):
         # If fix_query, distinguish direct vs follow-up
         if operation_type == "fix_query":
             if contains_sql:
-                state.metadata["fix_query_type"] = "direct"
+                state["metadata"]["fix_query_type"] = "direct"
             else:
-                state.metadata["fix_query_type"] = "followup"
+                state["metadata"]["fix_query_type"] = "followup"
         else:
-            state.metadata["fix_query_type"] = None
+            state["metadata"]["fix_query_type"] = None
 
-        state.metadata["operation_type"] = operation_type
-        state.current_step = "analyze_request"
+        state["metadata"]["operation_type"] = operation_type
+        state["current_step"] = "analyze_request"
         return state
 
     def _fix_query_followup(self, state: FlowState) -> FlowState:
         """Fix the last generated SQL based on user's follow-up correction or error message."""
         user_message = self.get_last_user_message(state) or ""
         # Try to get the last generated SQL from metadata or conversation
-        last_sql = state.metadata.get("generated_sql", "")
+        last_sql = state["metadata"].get("generated_sql", "")
         if not last_sql:
             # Try to find last assistant message with SQL
-            for msg in reversed(state.messages):
+            for msg in reversed(state["messages"]):
                 if hasattr(msg, "content") and isinstance(msg.content, str) and "select" in msg.content.lower():
                     # Extract SQL from markdown if present
                     sql_match = re.search(r"```sql(.*?)```", msg.content, re.DOTALL | re.IGNORECASE)
@@ -143,15 +143,15 @@ class TextToSQLFlow(BaseFlow):
         # Clean up SQL formatting
         fixed_sql = re.sub(r'```sql\s*', '', fixed_sql)
         fixed_sql = re.sub(r'\s*```', '', fixed_sql)
-        state.metadata["generated_sql"] = fixed_sql
-        state.current_step = "fix_query_followup"
+        state["metadata"]["generated_sql"] = fixed_sql
+        state["current_step"] = "fix_query_followup"
         return state
 
     def _route_after_analysis(self, state: FlowState) -> str:
         """Route to appropriate step based on operation type and fix_query type"""
-        operation_type = state.metadata.get("operation_type", "new_query")
+        operation_type = state["metadata"].get("operation_type", "new_query")
         if operation_type == "fix_query":
-            if state.metadata.get("fix_query_type") == "followup":
+            if state["metadata"].get("fix_query_type") == "followup":
                 return "fix_query_followup"
             else:
                 return "fix_query"
@@ -187,17 +187,17 @@ class TextToSQLFlow(BaseFlow):
         
         try:
             table_data = json.loads(str(response.content))
-            state.metadata["identified_tables"] = table_data["tables"]
+            state["metadata"]["identified_tables"] = table_data["tables"]
         except:
             # Fallback if JSON parsing fails
-            state.metadata["identified_tables"] = [{"name": "users", "reasoning": "Default table"}]
+            state["metadata"]["identified_tables"] = [{"name": "users", "reasoning": "Default table"}]
         
-        state.current_step = "identify_tables"
+        state["current_step"] = "identify_tables"
         return state
     
     def _validate_tables(self, state: FlowState) -> FlowState:
         """Human-in-the-loop validation for table selection"""
-        identified_tables = state.metadata.get("identified_tables", [])
+        identified_tables = state["metadata"].get("identified_tables", [])
         user_message = self.get_last_user_message(state)
         
         # Create validation message for UI
@@ -216,27 +216,27 @@ class TextToSQLFlow(BaseFlow):
         """
         
         # Store validation request for UI
-        state.metadata["validation_request"] = {
+        state["metadata"]["validation_request"] = {
             "type": "table_selection",
             "message": validation_message,
             "data": identified_tables
         }
         
         # For now, assume approval (in real implementation, this would wait for UI response)
-        state.metadata["table_validation_approved"] = True
-        state.current_step = "validate_tables"
+        state["metadata"]["table_validation_approved"] = True
+        state["current_step"] = "validate_tables"
         
         return state
     
     def _route_after_table_validation(self, state: FlowState) -> str:
         """Route based on table validation result"""
-        approved = state.metadata.get("table_validation_approved", True)
+        approved = state["metadata"].get("table_validation_approved", True)
         return "approved" if approved else "rejected"
     
     def _identify_columns(self, state: FlowState) -> FlowState:
         """Identify relevant columns from the selected tables"""
         user_message = self.get_last_user_message(state)
-        identified_tables = state.metadata.get("identified_tables", [])
+        identified_tables = state["metadata"].get("identified_tables", [])
         
         # Get column information for identified tables
         table_columns = {}
@@ -268,20 +268,20 @@ class TextToSQLFlow(BaseFlow):
         
         try:
             column_data = json.loads(str(response.content))
-            state.metadata["identified_columns"] = column_data["table_columns"]
+            state["metadata"]["identified_columns"] = column_data["table_columns"]
         except:
             # Fallback
-            state.metadata["identified_columns"] = []
+            state["metadata"]["identified_columns"] = []
         
-        state.current_step = "identify_columns"
+        state["current_step"] = "identify_columns"
         return state
     
     def _generate_sql(self, state: FlowState) -> FlowState:
         """Generate SQL query based on user request and identified tables/columns"""
         user_message = self.get_last_user_message(state)
-        identified_tables = state.metadata.get("identified_tables", [])
-        identified_columns = state.metadata.get("identified_columns", [])
-        operation_type = state.metadata.get("operation_type", "new_query")
+        identified_tables = state["metadata"].get("identified_tables", [])
+        identified_columns = state["metadata"].get("identified_columns", [])
+        operation_type = state["metadata"].get("operation_type", "new_query")
         
         # Build context for SQL generation
         table_context = ""
@@ -317,14 +317,14 @@ class TextToSQLFlow(BaseFlow):
         generated_sql = re.sub(r'```sql\s*', '', generated_sql)
         generated_sql = re.sub(r'\s*```', '', generated_sql)
         
-        state.metadata["generated_sql"] = generated_sql
-        state.current_step = "generate_sql"
+        state["metadata"]["generated_sql"] = generated_sql
+        state["current_step"] = "generate_sql"
         
         return state
     
     def _validate_sql(self, state: FlowState) -> FlowState:
         """Validate the generated SQL query"""
-        generated_sql = state.metadata.get("generated_sql", "")
+        generated_sql = state["metadata"].get("generated_sql", "")
         user_message = self.get_last_user_message(state)
         
         validation_prompt = f"""
@@ -359,22 +359,22 @@ class TextToSQLFlow(BaseFlow):
             errors = []
             suggestions = []
         
-        state.metadata["sql_validation"] = {
+        state["metadata"]["sql_validation"] = {
             "is_valid": is_valid,
             "errors": errors,
             "suggestions": suggestions
         }
         
         # For now, assume validation passes (in real implementation, this would check actual DB)
-        state.metadata["sql_validation_approved"] = True
-        state.current_step = "validate_sql"
+        state["metadata"]["sql_validation_approved"] = True
+        state["current_step"] = "validate_sql"
         
         return state
     
     def _route_after_sql_validation(self, state: FlowState) -> str:
         """Route based on SQL validation result"""
-        validation = state.metadata.get("sql_validation", {})
-        approved = state.metadata.get("sql_validation_approved", True)
+        validation = state["metadata"].get("sql_validation", {})
+        approved = state["metadata"].get("sql_validation_approved", True)
         
         if approved and validation.get("is_valid", True):
             return "approved"
@@ -383,9 +383,9 @@ class TextToSQLFlow(BaseFlow):
     
     def _finalize_response(self, state: FlowState) -> FlowState:
         """Finalize the response with the generated SQL"""
-        generated_sql = state.metadata.get("generated_sql", "")
-        identified_tables = state.metadata.get("identified_tables", [])
-        identified_columns = state.metadata.get("identified_columns", [])
+        generated_sql = state["metadata"].get("generated_sql", "")
+        identified_tables = state["metadata"].get("identified_tables", [])
+        identified_columns = state["metadata"].get("identified_columns", [])
         
         # Create comprehensive response
         response_parts = []
@@ -411,7 +411,7 @@ class TextToSQLFlow(BaseFlow):
         
         # Add the response to the conversation
         state = self.add_message(state, final_response, "assistant")
-        state.current_step = "finalize_response"
+        state["current_step"] = "finalize_response"
         
         return state
     

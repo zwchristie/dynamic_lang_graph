@@ -1,4 +1,5 @@
 from pydantic_settings import BaseSettings
+from pydantic import SecretStr
 from typing import Optional
 from dotenv import load_dotenv
 
@@ -20,11 +21,11 @@ load_dotenv()
 
 class Settings(BaseSettings):
     provider: str = "openai"  # "openai" or "bedrock"
-    openai_api_key: str = ""
+    openai_api_key: SecretStr = SecretStr("")
     openai_model: str = "gpt-4"
     bedrock_region: Optional[str] = None
-    bedrock_access_key: Optional[str] = None
-    bedrock_secret_key: Optional[str] = None
+    bedrock_access_key: Optional[SecretStr] = None
+    bedrock_secret_key: Optional[SecretStr] = None
     bedrock_llm_model_id: Optional[str] = None
     bedrock_embedding_model_id: Optional[str] = None
     database_url: str = "sqlite:///./app.db"
@@ -36,6 +37,6 @@ class Settings(BaseSettings):
     custom_invoke_endpoint: Optional[str] = None
     custom_token_endpoint: Optional[str] = None
     custom_conversation_endpoint: Optional[str] = None
-    custom_api_key: Optional[str] = None
+    custom_api_key: Optional[SecretStr] = None
 
 settings = Settings()

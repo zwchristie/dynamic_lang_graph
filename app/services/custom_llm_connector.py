@@ -11,7 +11,7 @@ class CustomLLMConnector:
         self.invoke_endpoint = settings.custom_invoke_endpoint or "/api/invoke"
         self.token_endpoint = settings.custom_token_endpoint or "/api/token"
         self.conversation_endpoint = settings.custom_conversation_endpoint or "/api/conversation"
-        self.api_key = settings.custom_api_key or "mock-api-key"
+        self.api_key = settings.custom_api_key.get_secret_value() if settings.custom_api_key else "mock-api-key"
 
     def generate_token(self) -> str:
         """Obtain an access token from the custom provider (mock implementation)."""
