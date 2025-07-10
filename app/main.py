@@ -268,4 +268,23 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    
+    # Get SSL context if available
+    ssl_context = settings.ssl_context
+    
+    # Run with SSL if certificates are available
+    if ssl_context:
+        print(f"Starting server with SSL on {settings.host}:{settings.port}")
+        uvicorn.run(
+            app, 
+            host=settings.host, 
+            port=settings.port,
+            **ssl_context
+        )
+    else:
+        print(f"Starting server without SSL on {settings.host}:{settings.port}")
+        uvicorn.run(
+            app, 
+            host=settings.host, 
+            port=settings.port
+        ) 
