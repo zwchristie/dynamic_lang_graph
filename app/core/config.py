@@ -38,5 +38,6 @@ class Settings(BaseSettings):
     custom_token_endpoint: Optional[str] = None
     custom_conversation_endpoint: Optional[str] = None
     custom_api_key: Optional[SecretStr] = None
+    custom_tenant_id: Optional[str] = None
 
 settings = Settings()

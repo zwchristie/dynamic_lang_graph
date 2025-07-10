@@ -1,8 +1,8 @@
-from typing import Dict, Any
+from typing import Dict, Any, List
 from langgraph.graph import StateGraph, END
 from langchain.schema import HumanMessage, AIMessage
 from langchain_openai import ChatOpenAI
-from .base import BaseFlow, FlowState, flow
+from .base import BaseFlow, FlowState, flow, NodeDescription
 from ..core.config import settings
 
 @flow(name="general_qa", description="Answer general questions and provide helpful information")
@@ -15,6 +15,35 @@ class GeneralQAFlow(BaseFlow):
             api_key=settings.openai_api_key
         )
         super().__init__()
+    
+    def get_node_descriptions(self) -> List[NodeDescription]:
+        """Get descriptions of all nodes for LLM planning"""
+        return [
+            {
+                "name": "analyze_question",
+                "description": "Analyzes the user's question to understand intent and determine response strategy",
+                "inputs": ["user_message"],
+                "outputs": ["question_analysis", "response_strategy"],
+                "possible_next_nodes": ["generate_response"],
+                "conditions": None
+            },
+            {
+                "name": "generate_response",
+                "description": "Generates a comprehensive response based on the question analysis",
+                "inputs": ["user_message", "question_analysis"],
+                "outputs": ["generated_response"],
+                "possible_next_nodes": ["finalize_response"],
+                "conditions": None
+            },
+            {
+                "name": "finalize_response",
+                "description": "Formats and finalizes the response for presentation to the user",
+                "inputs": ["generated_response"],
+                "outputs": ["final_response"],
+                "possible_next_nodes": ["END"],
+                "conditions": None
+            }
+        ]
     
     def _build_graph(self) -> StateGraph:
         """Build the general QA graph"""
@@ -37,28 +66,25 @@ class GeneralQAFlow(BaseFlow):
         return workflow
     
     def _analyze_question(self, state: FlowState) -> FlowState:
-        """Analyze the user's question to understand intent"""
-        user_message = self.get_last_user_message(state)
+        """Analyze the user's question to understand intent and determine response strategy"""
+        user_message = self.get_last_user_message(state) or ""
         
         analysis_prompt = f"""
-        Analyze the following user question and determine:
-        1. The type of question (factual, opinion, how-to, etc.)
-        2. The main topic or domain
-        3. Any specific requirements or constraints
+        Analyze the following question to understand the user's intent and determine the best response strategy.
         
-        User question: {user_message}
+        Question: {user_message}
         
-        Provide a brief analysis in JSON format:
-        {{
-            "question_type": "type",
-            "topic": "main_topic",
-            "requirements": ["req1", "req2"],
-            "complexity": "low|medium|high"
-        }}
+        Please provide:
+        1. Question type (factual, opinion, how-to, etc.)
+        2. Key topics or concepts involved
+        3. Required depth of response
+        4. Any special considerations
+        
+        Return your analysis in a structured format.
         """
         
         response = self.llm.invoke([HumanMessage(content=analysis_prompt)])
-        analysis = response.content
+        analysis = str(response.content)
         
         state["metadata"]["question_analysis"] = analysis
         state["current_step"] = "analyze_question"
@@ -67,7 +93,7 @@ class GeneralQAFlow(BaseFlow):
     
     def _generate_response(self, state: FlowState) -> FlowState:
         """Generate a comprehensive response to the user's question"""
-        user_message = self.get_last_user_message(state)
+        user_message = self.get_last_user_message(state) or ""
         analysis = state["metadata"].get("question_analysis", "")
         
         response_prompt = f"""

@@ -1,172 +1,339 @@
-from typing import Dict, Any, List, Optional
+import logging
+from typing import Dict, Any, List, Optional, Union
+from langchain_core.language_models import BaseLLM
+from langchain_community.llms import Bedrock
 from langchain_openai import ChatOpenAI
-from langchain.schema import HumanMessage, SystemMessage
+from .flow_registry import FlowRegistryService
+from .conversation_manager import conversation_manager, MessageRole
+from .contextual_llm_service import contextual_llm_service
+from .custom_llm_connector import contextual_custom_llm_service
 from ..core.config import settings
-from ..flows.base import FLOW_REGISTRY, FlowState
-from ..models.schemas import Message, MessageRole
-import json
+
+logger = logging.getLogger(__name__)
 
 class OrchestratorService:
-    """LLM orchestrator that dynamically generates workflows based on available flows"""
+    """Orchestrator service that manages flow execution and LLM provider selection"""
     
     def __init__(self):
-        self.llm = ChatOpenAI(
-            model=settings.openai_model,
-            temperature=0.7,
-            api_key=settings.openai_api_key
-        )
-        self.flows = self._get_all_flows()
+        self.flow_registry = FlowRegistryService()
+        self.contextual_llm_service = contextual_llm_service
+        self.contextual_custom_llm_service = contextual_custom_llm_service
+        self._initialize_llm_providers()
     
-    def _get_all_flows(self) -> List[Any]:
-        """Get all registered flow instances"""
-        return [flow_class() for flow_class in FLOW_REGISTRY.values()]
-    
-    def get_available_flows_context(self) -> str:
-        """Get formatted context of all available flows for LLM"""
-        flow_descriptions = []
-        
-        for flow in self.flows:
-            flow_descriptions.append(f"**{flow.flow_name}**: {flow.get_description()}")
-        
-        return "\n\n".join(flow_descriptions)
-    
-    def determine_appropriate_flow(self, user_message: str, conversation_history: List[Message]) -> str:
-        """Use LLM to determine which flow is most appropriate for the user's request"""
-        
-        # Format conversation history
-        history_text = ""
-        for msg in conversation_history:
-            role = "User" if msg.role == MessageRole.USER else "Assistant"
-            history_text += f"{role}: {msg.content}\n"
-        
-        # Get available flows context
-        flows_context = self.get_available_flows_context()
-        
-        system_prompt = f"""
-        You are an intelligent workflow orchestrator. Your job is to determine which workflow/flow 
-        is most appropriate for handling a user's request.
-        
-        Available flows:
-        {flows_context}
-        
-        Analyze the user's request and conversation history to determine which flow should handle it.
-        Consider the user's intent, the type of request, and any context from the conversation.
-        
-        Return only the flow name that best matches the request. If no specific flow is needed, 
-        return "general_qa" for general questions.
-        """
-        
-        user_prompt = f"""
-        Conversation history:
-        {history_text}
-        
-        Current user request: {user_message}
-        
-        Which flow should handle this request? Return only the flow name.
-        """
-        
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_prompt)
-        ]
-        
-        response = self.llm.invoke(messages)
-        selected_flow = str(response.content).strip().lower()
-        
-        # Validate that the selected flow exists
-        if selected_flow not in [flow.flow_name for flow in self.flows]:
-            selected_flow = "general_qa"  # Default fallback
-        
-        return selected_flow
-    
-    def execute_flow(self, flow_name: str, messages: List[Message], session_id: Optional[str] = None) -> Dict[str, Any]:
-        """Execute a specific flow with the given messages"""
-        
-        flow = self._get_flow_by_name(flow_name)
-        if not flow:
-            raise ValueError(f"Flow '{flow_name}' not found")
-        
-        # Convert messages to LangChain format
-        lc_messages = []
-        for msg in messages:
-            if msg.role == MessageRole.USER:
-                from langchain.schema import HumanMessage
-                lc_messages.append(HumanMessage(content=msg.content))
-            elif msg.role == MessageRole.ASSISTANT:
-                from langchain.schema import AIMessage
-                lc_messages.append(AIMessage(content=msg.content))
-            elif msg.role == MessageRole.SYSTEM:
-                from langchain.schema import SystemMessage
-                lc_messages.append(SystemMessage(content=msg.content))
-        
-        # Create initial state
-        state: FlowState = {
-            "messages": lc_messages,
-            "session_id": session_id or "default",
-            "current_step": "start",
-            "metadata": {},
-            "error": None
-        }
-        
-        # Execute the flow
-        result_state = flow.run(state)
-        
-        # Extract the last assistant message as response
-        response_content = ""
-        for message in reversed(result_state["messages"]):
-            if hasattr(message, 'content'):
-                response_content = message.content
-                break
-        
-        return {
-            "response": response_content,
-            "session_id": result_state["session_id"],
-            "flow_name": flow_name,
-            "metadata": result_state["metadata"],
-            "error": result_state["error"]
+    def _initialize_llm_providers(self):
+        """Initialize different LLM providers"""
+        self.llm_providers = {
+            "openai": self._create_openai_llm(),
+            "bedrock": self._create_bedrock_llm(),
+            "custom": self.contextual_custom_llm_service
         }
     
-    def _get_flow_by_name(self, name: str) -> Optional[Any]:
-        """Get a flow instance by name"""
-        if name in FLOW_REGISTRY:
-            return FLOW_REGISTRY[name]()
-        return None
+    def _create_openai_llm(self) -> Optional[Union[BaseLLM, ChatOpenAI]]:
+        """Create OpenAI LLM instance"""
+        try:
+            return ChatOpenAI(
+                api_key=settings.openai_api_key,
+                model=settings.openai_model,
+                temperature=0.1
+            )
+        except Exception as e:
+            logger.error(f"Failed to create OpenAI LLM: {e}")
+            return None
     
-    def process_chat_request(self, messages: List[Message], session_id: Optional[str] = None, specified_flow: Optional[str] = None) -> Dict[str, Any]:
-        """Process a chat request by determining the appropriate flow and executing it"""
+    def _create_bedrock_llm(self) -> Optional[Union[BaseLLM, Bedrock]]:
+        """Create Bedrock LLM instance"""
+        try:
+            return Bedrock(
+                region_name=settings.bedrock_region,
+                aws_access_key_id=settings.bedrock_access_key.get_secret_value() if settings.bedrock_access_key else None,
+                aws_secret_access_key=settings.bedrock_secret_key.get_secret_value() if settings.bedrock_secret_key else None,
+                model_id=settings.bedrock_llm_model_id or "anthropic.claude-3-sonnet-20240229-v1:0",
+                model_kwargs={"temperature": 0.1}
+            )
+        except Exception as e:
+            logger.error(f"Failed to create Bedrock LLM: {e}")
+            return None
+    
+    def get_llm_provider(self, provider: str = "openai"):
+        """Get LLM provider based on provider name"""
+        return self.llm_providers.get(provider)
+    
+    def determine_flow_with_context(
+        self, 
+        session_id: str, 
+        user_message: str, 
+        available_flows: Optional[List[str]] = None,
+        provider: str = "openai",
+        system_prompt: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Determine the best flow to execute using LLM with conversation context
         
-        # Get the last user message
-        user_message = ""
-        for msg in reversed(messages):
-            if msg.role == MessageRole.USER:
-                user_message = msg.content
-                break
-        
-        if not user_message:
+        Args:
+            session_id: Session identifier
+            user_message: User's message
+            available_flows: List of available flow names (if None, uses all registered flows)
+            provider: LLM provider to use ("openai", "bedrock", or "custom")
+            system_prompt: Optional system prompt for flow determination
+            
+        Returns:
+            Dictionary with flow determination results
+        """
+        try:
+            # Get available flows
+            if available_flows is None:
+                available_flows = self.flow_registry.list_flow_names()
+            
+            # Create flow selection prompt
+            flow_descriptions = []
+            for flow_name in available_flows:
+                flow_info = self.flow_registry.get_flow_by_name(flow_name)
+                if flow_info:
+                    description = flow_info.description
+                    flow_descriptions.append(f"- {flow_name}: {description}")
+            
+            flows_text = "\n".join(flow_descriptions)
+            
+            # Create system prompt for flow determination
+            flow_system_prompt = system_prompt or f"""
+You are an AI assistant that determines the best workflow to execute based on user requests.
+
+Available workflows:
+{flows_text}
+
+Please analyze the user's request and determine which workflow would be most appropriate.
+Respond with the exact flow name from the list above, or "none" if no flow matches.
+
+User request: {user_message}
+"""
+            
+            # Use appropriate LLM provider
+            if provider == "custom":
+                # Use custom LLM service
+                response_content, conversation_id = self.contextual_custom_llm_service.invoke_with_context(
+                    session_id=session_id,
+                    user_message=user_message,
+                    system_prompt=flow_system_prompt,
+                    deployment_id="text_to_sql"  # Default deployment for flow determination
+                )
+                
+                # Extract flow name from response
+                flow_name = self._extract_flow_name_from_response(response_content, available_flows)
+                
+                return {
+                    "selected_flow": flow_name,
+                    "reasoning": response_content,
+                    "conversation_id": conversation_id,
+                    "provider": "custom",
+                    "available_flows": available_flows
+                }
+            else:
+                # Use standard LLM providers (OpenAI/Bedrock)
+                llm = self.get_llm_provider(provider)
+                if not llm:
+                    return {
+                        "error": f"LLM provider '{provider}' not available",
+                        "available_flows": available_flows
+                    }
+                
+                # Use contextual LLM service
+                response_content, conversation_id = self.contextual_llm_service.invoke_with_context(
+                    session_id=session_id,
+                    user_message=user_message,
+                    system_prompt=flow_system_prompt
+                )
+                
+                # Extract flow name from response
+                flow_name = self._extract_flow_name_from_response(response_content, available_flows)
+                
+                return {
+                    "selected_flow": flow_name,
+                    "reasoning": response_content,
+                    "conversation_id": conversation_id,
+                    "provider": provider,
+                    "available_flows": available_flows
+                }
+                
+        except Exception as e:
+            logger.error(f"Error in flow determination: {e}")
             return {
-                "response": "I didn't receive any user message to process.",
-                "session_id": session_id or "default",
-                "flow_name": "error",
-                "metadata": {},
-                "error": "No user message found"
+                "error": str(e),
+                "available_flows": available_flows or []
             }
-        
-        # Determine which flow to use
-        if specified_flow:
-            flow_name = specified_flow
-        else:
-            flow_name = self.determine_appropriate_flow(user_message, messages)
-        
-        # Execute the flow
-        return self.execute_flow(flow_name, messages, session_id)
     
-    def get_flow_info(self) -> List[Dict[str, str]]:
-        """Get information about all available flows"""
-        flow_info = []
-        for flow in self.flows:
-            flow_info.append({
-                "name": flow.flow_name,
-                "description": flow.flow_description,
-                "detailed_description": flow.get_description()
-            })
-        return flow_info 
+    def _extract_flow_name_from_response(self, response: str, available_flows: List[str]) -> Optional[str]:
+        """Extract flow name from LLM response"""
+        try:
+            # Clean the response
+            response_lower = response.lower().strip()
+            
+            # Check for exact matches
+            for flow_name in available_flows:
+                if flow_name.lower() in response_lower:
+                    return flow_name
+            
+            # Check for "none" or "no flow"
+            if "none" in response_lower or "no flow" in response_lower:
+                return None
+            
+            # If no exact match, return the first available flow as fallback
+            return available_flows[0] if available_flows else None
+            
+        except Exception as e:
+            logger.error(f"Error extracting flow name: {e}")
+            return available_flows[0] if available_flows else None
+    
+    def execute_flow_with_context(
+        self, 
+        session_id: str, 
+        flow_name: str, 
+        user_message: str,
+        provider: str = "openai",
+        system_prompt: Optional[str] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Execute a specific flow with conversation context
+        
+        Args:
+            session_id: Session identifier
+            flow_name: Name of the flow to execute
+            user_message: User's message
+            provider: LLM provider to use ("openai", "bedrock", or "custom")
+            system_prompt: Optional system prompt
+            **kwargs: Additional arguments for flow execution
+            
+        Returns:
+            Dictionary with flow execution results
+        """
+        try:
+            # Get the flow
+            flow_info = self.flow_registry.get_flow_by_name(flow_name)
+            if not flow_info:
+                return {
+                    "error": f"Flow '{flow_name}' not found",
+                    "available_flows": self.flow_registry.list_flow_names()
+                }
+            
+            # Get LLM provider
+            if provider == "custom":
+                llm_provider = self.contextual_custom_llm_service
+            else:
+                llm_provider = self.get_llm_provider(provider)
+                if not llm_provider:
+                    return {
+                        "error": f"LLM provider '{provider}' not available"
+                    }
+            
+            # Execute flow with context
+            if provider == "custom":
+                # Use custom LLM service for flow execution
+                response_content, conversation_id = self.contextual_custom_llm_service.invoke_with_context(
+                    session_id=session_id,
+                    user_message=user_message,
+                    system_prompt=system_prompt,
+                    deployment_id=flow_name,  # Use flow name as deployment ID
+                    **kwargs
+                )
+                
+                return {
+                    "flow_name": flow_name,
+                    "result": response_content,
+                    "conversation_id": conversation_id,
+                    "provider": "custom",
+                    "session_id": session_id
+                }
+            else:
+                # Use standard LLM providers
+                # For now, we'll use the contextual LLM service directly
+                # since the flow execution method needs to be updated
+                response_content, conversation_id = self.contextual_llm_service.invoke_with_context(
+                    session_id=session_id,
+                    user_message=user_message,
+                    system_prompt=system_prompt
+                )
+                
+                result = response_content
+                
+                return {
+                    "flow_name": flow_name,
+                    "result": result,
+                    "provider": provider,
+                    "session_id": session_id
+                }
+                
+        except Exception as e:
+            logger.error(f"Error executing flow '{flow_name}': {e}")
+            return {
+                "error": str(e),
+                "flow_name": flow_name,
+                "provider": provider
+            }
+    
+    def execute_with_planning(
+        self, 
+        session_id: str, 
+        user_message: str,
+        provider: str = "openai",
+        system_prompt: Optional[str] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Execute workflow with LLM-driven planning and conversation context
+        
+        Args:
+            session_id: Session identifier
+            user_message: User's message
+            provider: LLM provider to use ("openai", "bedrock", or "custom")
+            system_prompt: Optional system prompt
+            **kwargs: Additional arguments
+            
+        Returns:
+            Dictionary with execution results
+        """
+        try:
+            # Step 1: Determine the best flow
+            flow_determination = self.determine_flow_with_context(
+                session_id=session_id,
+                user_message=user_message,
+                provider=provider,
+                system_prompt=system_prompt
+            )
+            
+            if "error" in flow_determination:
+                return flow_determination
+            
+            selected_flow = flow_determination.get("selected_flow")
+            if not selected_flow:
+                return {
+                    "message": "No appropriate flow found for your request",
+                    "reasoning": flow_determination.get("reasoning", ""),
+                    "provider": provider
+                }
+            
+            # Step 2: Execute the selected flow
+            execution_result = self.execute_flow_with_context(
+                session_id=session_id,
+                flow_name=selected_flow,
+                user_message=user_message,
+                provider=provider,
+                system_prompt=system_prompt,
+                **kwargs
+            )
+            
+            # Combine results
+            return {
+                **execution_result,
+                "planning": flow_determination,
+                "selected_flow": selected_flow
+            }
+            
+        except Exception as e:
+            logger.error(f"Error in planning execution: {e}")
+            return {
+                "error": str(e),
+                "provider": provider
+            }
+
+# Global orchestrator service instance
+orchestrator_service = OrchestratorService() 

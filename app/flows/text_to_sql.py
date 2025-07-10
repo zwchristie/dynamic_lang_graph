@@ -1,12 +1,15 @@
 from typing import Dict, Any, List, Optional
 from langgraph.graph import StateGraph, END
-from langchain.schema import HumanMessage, AIMessage
+from langchain.schema import HumanMessage, AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
-from .base import BaseFlow, FlowState, flow
+from .base import BaseFlow, FlowState, flow, NodeDescription
 from ..core.config import settings
 from ..core.database import get_table_info
 import json
 import re
+import logging
+
+logger = logging.getLogger(__name__)
 
 @flow(name="text_to_sql", description="Convert natural language to SQL queries with validation and human-in-the-loop steps")
 class TextToSQLFlow(BaseFlow):
@@ -20,398 +23,515 @@ class TextToSQLFlow(BaseFlow):
         self.table_info = get_table_info()
         super().__init__()
     
+    def get_node_descriptions(self) -> List[NodeDescription]:
+        """Get descriptions of all nodes for LLM planning"""
+        return [
+            {
+                "name": "classify_prompt",
+                "description": "Analyzes user input to determine if it's a general question or SQL-related request",
+                "inputs": ["user_message"],
+                "outputs": ["classification"],
+                "possible_next_nodes": ["general_questions", "rewrite_prompt"],
+                "conditions": {
+                    "general": "general_questions",
+                    "text_to_sql": "rewrite_prompt"
+                }
+            },
+            {
+                "name": "rewrite_prompt",
+                "description": "Rewrites user prompt with additional context for better SQL generation",
+                "inputs": ["user_message"],
+                "outputs": ["rewritten_prompt"],
+                "possible_next_nodes": ["get_relevant_tables"],
+                "conditions": None
+            },
+            {
+                "name": "get_relevant_tables",
+                "description": "Identifies which database tables are needed for the SQL query",
+                "inputs": ["rewritten_prompt", "database_schema"],
+                "outputs": ["relevant_tables"],
+                "possible_next_nodes": ["has_user_approved"],
+                "conditions": None
+            },
+            {
+                "name": "has_user_approved",
+                "description": "Human-in-the-loop step for table confirmation (placeholder)",
+                "inputs": ["relevant_tables"],
+                "outputs": ["user_approved", "relevant_schema"],
+                "possible_next_nodes": ["trim_relevant_tables", "get_relevant_tables"],
+                "conditions": {
+                    "approved": "trim_relevant_tables",
+                    "rejected": "get_relevant_tables"
+                }
+            },
+            {
+                "name": "trim_relevant_tables",
+                "description": "Filters schema to only include columns needed for the query",
+                "inputs": ["rewritten_prompt", "relevant_schema"],
+                "outputs": ["trimmed_schema"],
+                "possible_next_nodes": ["generate_sql"],
+                "conditions": None
+            },
+            {
+                "name": "generate_sql",
+                "description": "Generates SQL query from natural language and schema",
+                "inputs": ["rewritten_prompt", "relevant_schema"],
+                "outputs": ["generated_sql"],
+                "possible_next_nodes": ["validate_sql"],
+                "conditions": None
+            },
+            {
+                "name": "validate_sql",
+                "description": "Validates generated SQL for correctness and relevance",
+                "inputs": ["generated_sql", "user_message", "relevant_schema"],
+                "outputs": ["sql_valid"],
+                "possible_next_nodes": ["execute_sql", "format_final_response", "generate_sql"],
+                "conditions": {
+                    "valid": "execute_sql",
+                    "invalid": "generate_sql",
+                    "no_execution_needed": "format_final_response"
+                }
+            },
+            {
+                "name": "execute_sql",
+                "description": "Executes the SQL query and fetches results",
+                "inputs": ["generated_sql"],
+                "outputs": ["executed_sql", "sql_error"],
+                "possible_next_nodes": ["format_final_response", "generate_sql"],
+                "conditions": {
+                    "success": "format_final_response",
+                    "error": "generate_sql"
+                }
+            },
+            {
+                "name": "format_final_response",
+                "description": "Formats the final response with results and metadata",
+                "inputs": ["final_llm_message", "executed_sql", "reasoning_steps"],
+                "outputs": ["formatted_response"],
+                "possible_next_nodes": ["END"],
+                "conditions": None
+            },
+            {
+                "name": "general_questions",
+                "description": "Handles general questions that don't require SQL",
+                "inputs": ["user_message"],
+                "outputs": ["final_llm_message"],
+                "possible_next_nodes": ["format_final_response"],
+                "conditions": None
+            }
+        ]
+    
     def _build_graph(self) -> StateGraph:
-        """Build the text-to-SQL graph with all validation steps"""
+        """Build the comprehensive text-to-SQL graph with all validation steps"""
         
         workflow = StateGraph(FlowState)
         
         # Add nodes
-        workflow.add_node("analyze_request", self._analyze_request)
-        workflow.add_node("identify_tables", self._identify_tables)
-        workflow.add_node("validate_tables", self._validate_tables)
-        workflow.add_node("identify_columns", self._identify_columns)
+        workflow.add_node("classify_prompt", self._classify_prompt)
+        workflow.add_node("rewrite_prompt", self._rewrite_prompt)
+        workflow.add_node("get_relevant_tables", self._get_relevant_tables)
+        workflow.add_node("has_user_approved", self._has_user_approved)
+        workflow.add_node("trim_relevant_tables", self._trim_relevant_tables)
         workflow.add_node("generate_sql", self._generate_sql)
         workflow.add_node("validate_sql", self._validate_sql)
-        workflow.add_node("finalize_response", self._finalize_response)
-        workflow.add_node("fix_query_followup", self._fix_query_followup)
+        workflow.add_node("execute_sql", self._execute_sql)
+        workflow.add_node("format_final_response", self._format_final_response)
+        workflow.add_node("general_questions", self._ask_general_question)
         
         # Set entry point
-        workflow.set_entry_point("analyze_request")
+        workflow.set_entry_point("classify_prompt")
         
         # Add conditional edges
         workflow.add_conditional_edges(
-            "analyze_request",
-            self._route_after_analysis,
+            "classify_prompt",
+            self._classify_prompt_edge,
             {
-                "new_query": "identify_tables",
-                "edit_query": "generate_sql",
-                "fix_query": "validate_sql",
-                "fix_query_followup": "fix_query_followup"
+                "general_questions": "general_questions",
+                "rewrite_prompt": "rewrite_prompt"
             }
         )
         
         workflow.add_conditional_edges(
-            "validate_tables",
-            self._route_after_table_validation,
+            "has_user_approved",
+            self._table_confirmation_from_user_edge,
             {
-                "approved": "identify_columns",
-                "rejected": "identify_tables"
+                "trim_relevant_tables": "trim_relevant_tables",
+                "get_relevant_tables": "get_relevant_tables"
             }
         )
         
         workflow.add_conditional_edges(
             "validate_sql",
-            self._route_after_sql_validation,
+            self._validate_edge,
             {
-                "approved": "finalize_response",
-                "rejected": "generate_sql"
+                "execute_sql": "execute_sql",
+                "format_final_response": "format_final_response",
+                "generate_sql": "generate_sql"
+            }
+        )
+        
+        workflow.add_conditional_edges(
+            "execute_sql",
+            self._sql_executed_edge,
+            {
+                "format_final_response": "format_final_response",
+                "generate_sql": "generate_sql"
             }
         )
         
         # Add regular edges
-        workflow.add_edge("identify_tables", "validate_tables")
-        workflow.add_edge("identify_columns", "generate_sql")
+        workflow.add_edge("rewrite_prompt", "get_relevant_tables")
+        workflow.add_edge("get_relevant_tables", "has_user_approved")
+        workflow.add_edge("trim_relevant_tables", "generate_sql")
         workflow.add_edge("generate_sql", "validate_sql")
-        workflow.add_edge("finalize_response", END)
-        workflow.add_edge("fix_query_followup", "finalize_response")
+        workflow.add_edge("general_questions", "format_final_response")
+        workflow.add_edge("format_final_response", END)
         
         return workflow
     
-    def _analyze_request(self, state: FlowState) -> FlowState:
-        """Analyze the user request to determine operation type and fix_query subtype"""
+    def _add_reasoning_step(self, state: FlowState, step: str) -> None:
+        """Add a reasoning step to the state"""
+        if "reasoning_steps" not in state["metadata"]:
+            state["metadata"]["reasoning_steps"] = []
+        state["metadata"]["reasoning_steps"].append(step)
+    
+    def _classify_prompt(self, state: FlowState) -> FlowState:
+        """Classify user prompt as 'general' or 'text_to_sql'"""
         user_message = self.get_last_user_message(state) or ""
-
-        # Auto-detect if user message contains a SQL query (simple heuristic)
-        contains_sql = bool(re.search(r"select |update |insert |delete |from |where |join |create table|drop table|alter table", user_message, re.IGNORECASE))
+        logger.info("Classifying Prompt: %s", user_message)
         
-        analysis_prompt = f"""
-        Analyze the following user request and determine the type of SQL operation needed:
+        classification_prompt = f"""
+        Classify the prompt below as only 'general' or 'text_to_sql'.
         
-        User request: {user_message}
+        Prompt: {user_message}
         
-        Determine if this is:
-        1. "new_query" - User wants to generate a new SQL query from natural language
-        2. "edit_query" - User wants to modify an existing SQL query
-        3. "fix_query" - User wants to fix a SQL query with syntax errors
-        
-        Return only the operation type: new_query, edit_query, or fix_query
+        Return only: general or text_to_sql
         """
         
-        response = self.llm.invoke([HumanMessage(content=analysis_prompt)])
-        operation_type = str(response.content).strip().lower()
-
-        # If fix_query, distinguish direct vs follow-up
-        if operation_type == "fix_query":
-            if contains_sql:
-                state["metadata"]["fix_query_type"] = "direct"
-            else:
-                state["metadata"]["fix_query_type"] = "followup"
+        response = self.llm.invoke([HumanMessage(content=classification_prompt)])
+        classification = str(response.content).strip().lower()
+        
+        # Ensure classification is one of the allowed values
+        if classification in ["general", "text_to_sql"]:
+            state["metadata"]["classification"] = classification
         else:
-            state["metadata"]["fix_query_type"] = None
-
-        state["metadata"]["operation_type"] = operation_type
-        state["current_step"] = "analyze_request"
+            state["metadata"]["classification"] = "general"  # Default to general
+        
+        state["current_step"] = "classify_prompt"
         return state
-
-    def _fix_query_followup(self, state: FlowState) -> FlowState:
-        """Fix the last generated SQL based on user's follow-up correction or error message."""
+    
+    def _classify_prompt_edge(self, state: FlowState) -> str:
+        """Route based on classification"""
+        classification = state["metadata"].get("classification", "general")
+        return "general_questions" if classification == "general" else "rewrite_prompt"
+    
+    def _rewrite_prompt(self, state: FlowState) -> FlowState:
+        """Rewrite prompt with extra metadata for SQL generation"""
         user_message = self.get_last_user_message(state) or ""
-        # Try to get the last generated SQL from metadata or conversation
-        last_sql = state["metadata"].get("generated_sql", "")
-        if not last_sql:
-            # Try to find last assistant message with SQL
-            for msg in reversed(state["messages"]):
-                if hasattr(msg, "content") and isinstance(msg.content, str) and "select" in msg.content.lower():
-                    # Extract SQL from markdown if present
-                    sql_match = re.search(r"```sql(.*?)```", msg.content, re.DOTALL | re.IGNORECASE)
-                    if sql_match:
-                        last_sql = sql_match.group(1).strip()
-                    else:
-                        last_sql = msg.content.strip()
+        self._add_reasoning_step(state, "Rewriting prompt")
+        
+        # Create a system prompt for SQL generation
+        sql_system_prompt = """
+        You are a SQL expert. When given a natural language query, you should:
+        1. Understand the user's intent
+        2. Identify the relevant database tables and columns
+        3. Generate accurate SQL queries
+        4. Provide clear explanations
+        
+        Always return valid SQL syntax and explain your reasoning.
+        """
+        
+        rewrite_prompt = f"""
+        {sql_system_prompt}
+        
+        Original user request: {user_message}
+        
+        Please rewrite this request to be more specific for SQL generation, 
+        including any clarifying details that would help generate accurate SQL.
+        """
+        
+        response = self.llm.invoke([HumanMessage(content=rewrite_prompt)])
+        rewritten_prompt = str(response.content).strip()
+        
+        self._add_reasoning_step(state, f"Rewritten Prompt: {rewritten_prompt}")
+        logger.info("Rewritten Prompt: %s", rewritten_prompt)
+        
+        state["metadata"]["rewritten_prompt"] = rewritten_prompt
+        state["current_step"] = "rewrite_prompt"
+        
+        return state
+    
+    def _get_relevant_tables(self, state: FlowState) -> FlowState:
+        """Identify DB tables likely needed"""
+        user_message = state["metadata"].get("rewritten_prompt") or self.get_last_user_message(state) or ""
+        
+        # Get concise schema information
+        available_tables = [table["name"] for table in self.table_info["tables"]]
+        table_schemas = {}
+        for table in self.table_info["tables"]:
+            columns = [col["name"] for col in table.get("columns", [])]
+            table_schemas[table["name"]] = columns
+        
+        concise_schema = json.dumps(table_schemas, indent=2)
+        
+        table_identification_prompt = f"""
+        Based on the user request, identify the relevant database tables and their purpose.
+        
+        User request: {user_message}
+        Available tables and their columns: {concise_schema}
+        
+        Return in JSON format:
+        {{
+            "tables": ["table1", "table2"],
+            "reasoning": "Why these tables are needed"
+        }}
+        """
+        
+        response = self.llm.invoke([HumanMessage(content=table_identification_prompt)])
+        
+        try:
+            content = str(response.content) if response.content else "{}"
+            result = json.loads(content)
+            tables = result.get("tables", [])
+            self._add_reasoning_step(state, f"Identified Relevant Tables: {tables}")
+        except:
+            logger.info("Table identification error")
+            tables = []
+        
+        state["metadata"]["relevant_tables"] = json.dumps(tables)
+        state["current_step"] = "get_relevant_tables"
+        
+        return state
+    
+    def _has_user_approved(self, state: FlowState) -> FlowState:
+        """Human-in-the-loop confirmation of table list (placeholder)"""
+        # TODO: integrate real UI approval
+        relevant_tables = state["metadata"].get("relevant_tables", "[]")
+        try:
+            tables = json.loads(relevant_tables)
+        except:
+            tables = []
+        
+        # Get relevant schema for identified tables
+        relevant_schema = {}
+        for table_name in tables:
+            for table in self.table_info["tables"]:
+                if table["name"] == table_name:
+                    relevant_schema[table_name] = [col["name"] for col in table.get("columns", [])]
                     break
         
-        prompt = f"""
-        The user previously received this SQL query:
-        {last_sql}
-
-        The user now says: {user_message}
-
-        Please update or fix the SQL query based on the user's feedback. If the user provided an error message, correct the SQL accordingly. If the user requested a change, apply it to the query. Return only the updated SQL query, no additional text.
-        """
-        response = self.llm.invoke([HumanMessage(content=prompt)])
-        fixed_sql = str(response.content).strip()
-        # Clean up SQL formatting
-        fixed_sql = re.sub(r'```sql\s*', '', fixed_sql)
-        fixed_sql = re.sub(r'\s*```', '', fixed_sql)
-        state["metadata"]["generated_sql"] = fixed_sql
-        state["current_step"] = "fix_query_followup"
-        return state
-
-    def _route_after_analysis(self, state: FlowState) -> str:
-        """Route to appropriate step based on operation type and fix_query type"""
-        operation_type = state["metadata"].get("operation_type", "new_query")
-        if operation_type == "fix_query":
-            if state["metadata"].get("fix_query_type") == "followup":
-                return "fix_query_followup"
-            else:
-                return "fix_query"
-        return operation_type
-    
-    def _identify_tables(self, state: FlowState) -> FlowState:
-        """Identify relevant tables for the SQL query"""
-        user_message = self.get_last_user_message(state)
-        available_tables = [table["name"] for table in self.table_info["tables"]]
+        self._add_reasoning_step(state, f"User approved tables: {tables}")
         
-        table_selection_prompt = f"""
-        Based on the user request, identify the relevant database tables needed.
+        state["metadata"]["user_approved"] = True  # Placeholder - should be user input
+        state["metadata"]["relevant_schema"] = relevant_schema
+        state["current_step"] = "has_user_approved"
+        
+        return state
+    
+    def _table_confirmation_from_user_edge(self, state: FlowState) -> str:
+        """Route based on user approval"""
+        return "trim_relevant_tables" if state["metadata"].get("user_approved") else "get_relevant_tables"
+    
+    def _trim_relevant_tables(self, state: FlowState) -> FlowState:
+        """Reduce metadata to only needed columns"""
+        user_message = state["metadata"].get("rewritten_prompt") or self.get_last_user_message(state) or ""
+        relevant_schema = state["metadata"].get("relevant_schema", {})
+        
+        trim_prompt = f"""
+        Based on the user request, identify only the relevant columns from the schema.
         
         User request: {user_message}
-        Available tables: {available_tables}
+        Available schema: {json.dumps(relevant_schema, indent=2)}
         
-        For each table, provide:
-        1. Table name
-        2. Reasoning for why it's needed
-        
-        Return in JSON format:
+        Return only the relevant columns in JSON format:
         {{
-            "tables": [
-                {{
-                    "name": "table_name",
-                    "reasoning": "why this table is needed"
-                }}
-            ]
+            "table_name": ["column1", "column2"]
         }}
         """
         
-        response = self.llm.invoke([HumanMessage(content=table_selection_prompt)])
+        response = self.llm.invoke([HumanMessage(content=trim_prompt)])
         
         try:
-            table_data = json.loads(str(response.content))
-            state["metadata"]["identified_tables"] = table_data["tables"]
+            trimmed_schema = json.loads(str(response.content))
+            self._add_reasoning_step(state, f"Trimmed schema: {trimmed_schema}")
         except:
-            # Fallback if JSON parsing fails
-            state["metadata"]["identified_tables"] = [{"name": "users", "reasoning": "Default table"}]
+            logger.info("Table trim error")
+            trimmed_schema = relevant_schema
         
-        state["current_step"] = "identify_tables"
-        return state
-    
-    def _validate_tables(self, state: FlowState) -> FlowState:
-        """Human-in-the-loop validation for table selection"""
-        identified_tables = state["metadata"].get("identified_tables", [])
-        user_message = self.get_last_user_message(state)
+        state["metadata"]["relevant_schema"] = trimmed_schema
+        state["current_step"] = "trim_relevant_tables"
         
-        # Create validation message for UI
-        table_names = [table["name"] for table in identified_tables]
-        table_reasons = [table["reasoning"] for table in identified_tables]
-        
-        validation_message = f"""
-        I've identified the following tables for your request: "{user_message}"
-        
-        Tables: {', '.join(table_names)}
-        
-        Reasoning:
-        {chr(10).join([f"- {table['name']}: {table['reasoning']}" for table in identified_tables])}
-        
-        Are these tables correct for your query? Please respond with 'yes' or 'no'.
-        """
-        
-        # Store validation request for UI
-        state["metadata"]["validation_request"] = {
-            "type": "table_selection",
-            "message": validation_message,
-            "data": identified_tables
-        }
-        
-        # For now, assume approval (in real implementation, this would wait for UI response)
-        state["metadata"]["table_validation_approved"] = True
-        state["current_step"] = "validate_tables"
-        
-        return state
-    
-    def _route_after_table_validation(self, state: FlowState) -> str:
-        """Route based on table validation result"""
-        approved = state["metadata"].get("table_validation_approved", True)
-        return "approved" if approved else "rejected"
-    
-    def _identify_columns(self, state: FlowState) -> FlowState:
-        """Identify relevant columns from the selected tables"""
-        user_message = self.get_last_user_message(state)
-        identified_tables = state["metadata"].get("identified_tables", [])
-        
-        # Get column information for identified tables
-        table_columns = {}
-        for table_info in self.table_info["tables"]:
-            if table_info["name"] in [t["name"] for t in identified_tables]:
-                table_columns[table_info["name"]] = table_info["columns"]
-        
-        column_selection_prompt = f"""
-        Based on the user request and selected tables, identify the relevant columns needed.
-        
-        User request: {user_message}
-        Selected tables and their columns: {table_columns}
-        
-        For each table, identify which columns are needed for the query.
-        
-        Return in JSON format:
-        {{
-            "table_columns": [
-                {{
-                    "table": "table_name",
-                    "columns": ["col1", "col2"],
-                    "reasoning": "why these columns are needed"
-                }}
-            ]
-        }}
-        """
-        
-        response = self.llm.invoke([HumanMessage(content=column_selection_prompt)])
-        
-        try:
-            column_data = json.loads(str(response.content))
-            state["metadata"]["identified_columns"] = column_data["table_columns"]
-        except:
-            # Fallback
-            state["metadata"]["identified_columns"] = []
-        
-        state["current_step"] = "identify_columns"
         return state
     
     def _generate_sql(self, state: FlowState) -> FlowState:
-        """Generate SQL query based on user request and identified tables/columns"""
-        user_message = self.get_last_user_message(state)
-        identified_tables = state["metadata"].get("identified_tables", [])
-        identified_columns = state["metadata"].get("identified_columns", [])
-        operation_type = state["metadata"].get("operation_type", "new_query")
+        """Generate SQL query"""
+        user_message = state["metadata"].get("rewritten_prompt") or self.get_last_user_message(state) or ""
+        schema = state["metadata"].get("relevant_schema", {})
         
-        # Build context for SQL generation
-        table_context = ""
-        for table in identified_tables:
-            table_context += f"Table '{table['name']}': {table['reasoning']}\n"
+        if not schema:
+            state["metadata"]["generated_sql"] = ""
+            state["current_step"] = "generate_sql"
+            return state
         
-        column_context = ""
-        for col_info in identified_columns:
-            column_context += f"Table '{col_info['table']}' columns: {', '.join(col_info['columns'])} - {col_info['reasoning']}\n"
+        retries = state["metadata"].get("sql_failed_times", 0)
         
-        sql_generation_prompt = f"""
-        Generate a SQL query based on the following information:
+        if retries == 0 and not state["metadata"].get("final_sql_execution_error") and not state["metadata"].get("empty_sql_return"):
+            # First attempt
+            sql_prompt = f"""
+            Generate a SQL query based on the user request.
+            
+            User request: {user_message}
+            Available schema: {json.dumps(schema, indent=2)}
+            
+            Return only the SQL query, no additional text or explanations.
+            """
+        else:
+            # Retry with error context
+            error_msg = state["metadata"].get("final_sql_execution_error", "")
+            empty_return = state["metadata"].get("empty_sql_return", False)
+            previous_sql = state["metadata"].get("generated_sql", "")
+            
+            sql_prompt = f"""
+            Fix the SQL query based on the error or user feedback.
+            
+            User request: {user_message}
+            Available schema: {json.dumps(schema, indent=2)}
+            Previous SQL: {previous_sql}
+            Error: {error_msg}
+            Empty return: {empty_return}
+            
+            Return only the corrected SQL query, no additional text.
+            """
         
-        User request: {user_message}
-        Operation type: {operation_type}
+        response = self.llm.invoke([HumanMessage(content=sql_prompt)])
+        sql_query = str(response.content).strip()
         
-        Table context:
-        {table_context}
+        # Clean up SQL formatting
+        sql_query = re.sub(r'```sql\s*', '', sql_query)
+        sql_query = re.sub(r'\s*```', '', sql_query)
         
-        Column context:
-        {column_context}
+        self._add_reasoning_step(state, f"Generated SQL: {sql_query}")
         
-        Generate a valid SQL query that fulfills the user's request. 
-        Ensure the query is syntactically correct and follows SQL best practices.
-        
-        Return only the SQL query, no additional text.
-        """
-        
-        response = self.llm.invoke([HumanMessage(content=sql_generation_prompt)])
-        generated_sql = str(response.content).strip()
-        
-        # Clean up the SQL (remove markdown formatting if present)
-        generated_sql = re.sub(r'```sql\s*', '', generated_sql)
-        generated_sql = re.sub(r'\s*```', '', generated_sql)
-        
-        state["metadata"]["generated_sql"] = generated_sql
+        state["metadata"]["generated_sql"] = sql_query
+        state["metadata"]["final_llm_message"] = str(response.content)
         state["current_step"] = "generate_sql"
         
         return state
     
     def _validate_sql(self, state: FlowState) -> FlowState:
-        """Validate the generated SQL query"""
-        generated_sql = state["metadata"].get("generated_sql", "")
-        user_message = self.get_last_user_message(state)
+        """Validate generated SQL"""
+        user_message = state["metadata"].get("rewritten_prompt") or self.get_last_user_message(state) or ""
+        sql_query = state["metadata"].get("generated_sql", "")
+        schema = state["metadata"].get("relevant_schema", {})
         
-        validation_prompt = f"""
-        Validate the following SQL query for syntax correctness and logical validity:
+        validate_prompt = f"""
+        Validate the SQL query for correctness and relevance to the user request.
         
-        SQL Query: {generated_sql}
-        Original request: {user_message}
+        User request: {user_message}
+        Generated SQL: {sql_query}
+        Available schema: {json.dumps(schema, indent=2)}
         
         Check for:
-        1. Syntax errors
-        2. Logical errors
-        3. Missing clauses
-        4. Incorrect table/column references
+        1. Syntax correctness
+        2. Relevance to user request
+        3. Proper table and column usage
         
-        Return a JSON response:
-        {{
-            "is_valid": true/false,
-            "errors": ["error1", "error2"],
-            "suggestions": ["suggestion1", "suggestion2"]
-        }}
+        Return only: VALID or INVALID
         """
         
-        response = self.llm.invoke([HumanMessage(content=validation_prompt)])
+        response = self.llm.invoke([HumanMessage(content=validate_prompt)])
+        validation_result = str(response.content).strip().upper()
         
-        try:
-            validation_result = json.loads(str(response.content))
-            is_valid = validation_result.get("is_valid", False)
-            errors = validation_result.get("errors", [])
-            suggestions = validation_result.get("suggestions", [])
-        except:
-            is_valid = True
-            errors = []
-            suggestions = []
+        is_valid = validation_result == "VALID"
         
-        state["metadata"]["sql_validation"] = {
-            "is_valid": is_valid,
-            "errors": errors,
-            "suggestions": suggestions
-        }
+        if is_valid:
+            logger.info("FINAL SQL QUERY: %s", sql_query)
         
-        # For now, assume validation passes (in real implementation, this would check actual DB)
-        state["metadata"]["sql_validation_approved"] = True
+        state["metadata"]["sql_valid"] = is_valid
         state["current_step"] = "validate_sql"
         
         return state
     
-    def _route_after_sql_validation(self, state: FlowState) -> str:
-        """Route based on SQL validation result"""
-        validation = state["metadata"].get("sql_validation", {})
-        approved = state["metadata"].get("sql_validation_approved", True)
-        
-        if approved and validation.get("is_valid", True):
-            return "approved"
-        else:
-            return "rejected"
+    def _validate_edge(self, state: FlowState) -> str:
+        """Route based on SQL validation"""
+        if state["metadata"].get("sql_valid"):
+            return "execute_sql" if state["metadata"].get("query_required", True) else "format_final_response"
+        return "generate_sql"
     
-    def _finalize_response(self, state: FlowState) -> FlowState:
-        """Finalize the response with the generated SQL"""
-        generated_sql = state["metadata"].get("generated_sql", "")
-        identified_tables = state["metadata"].get("identified_tables", [])
-        identified_columns = state["metadata"].get("identified_columns", [])
+    def _execute_sql(self, state: FlowState) -> FlowState:
+        """Run the SQL and fetch results (mock implementation)"""
+        if not state["metadata"].get("sql_valid"):
+            state["metadata"]["executed_sql"] = None
+            state["current_step"] = "execute_sql"
+            return state
         
-        # Create comprehensive response
-        response_parts = []
-        response_parts.append("Here's the SQL query for your request:")
-        response_parts.append("")
-        response_parts.append("```sql")
-        response_parts.append(generated_sql)
-        response_parts.append("```")
-        response_parts.append("")
+        sql_query = state["metadata"].get("generated_sql", "")
+        retries = state["metadata"].get("sql_failed_times", 0)
         
-        if identified_tables:
-            response_parts.append("**Tables used:**")
-            for table in identified_tables:
-                response_parts.append(f"- {table['name']}: {table['reasoning']}")
-            response_parts.append("")
+        try:
+            # Mock SQL execution - in real implementation, this would connect to database
+            # For now, we'll simulate a successful query
+            mock_results = [
+                {"id": 1, "name": "Example User", "email": "user@example.com"},
+                {"id": 2, "name": "Another User", "email": "another@example.com"}
+            ]
+            
+            state["metadata"]["executed_sql"] = {"status": "success", "data": mock_results}
+            state["metadata"]["sql_failed_times"] = retries
+            
+        except Exception as exc:
+            msg = str(exc)
+            logger.info("DB error: %s", msg)
+            state["metadata"]["executed_sql"] = None
+            state["metadata"]["sql_failed_times"] = retries + 1
+            state["metadata"]["final_sql_execution_error"] = msg
         
-        if identified_columns:
-            response_parts.append("**Columns selected:**")
-            for col_info in identified_columns:
-                response_parts.append(f"- {col_info['table']}: {', '.join(col_info['columns'])}")
+        state["current_step"] = "execute_sql"
+        return state
+    
+    def _sql_executed_edge(self, state: FlowState) -> str:
+        """Route based on SQL execution result"""
+        if state["metadata"].get("executed_sql") or state["metadata"].get("sql_failed_times", 0) >= 3:
+            return "format_final_response"
+        return "generate_sql"
+    
+    def _ask_general_question(self, state: FlowState) -> FlowState:
+        """Handle non-SQL user questions"""
+        user_message = self.get_last_user_message(state) or ""
         
-        final_response = "\n".join(response_parts)
+        general_prompt = f"""
+        Answer the following general question:
+        
+        {user_message}
+        
+        Provide a helpful and informative response.
+        """
+        
+        response = self.llm.invoke([HumanMessage(content=general_prompt)])
+        
+        state["metadata"]["final_llm_message"] = str(response.content)
+        state["current_step"] = "general_questions"
+        
+        return state
+    
+    def _format_final_response(self, state: FlowState) -> FlowState:
+        """Assemble final structured response"""
+        formatted = {
+            "conversation": state["metadata"].get("conversation_id"),
+            "Message": state["metadata"].get("final_llm_message"),
+            "QueryResults": state["metadata"].get("executed_sql"),
+            "ReasoningSteps": state["metadata"].get("reasoning_steps", []),
+            "GeneratedSQL": state["metadata"].get("generated_sql"),
+            "SQLValid": state["metadata"].get("sql_valid"),
+            "Classification": state["metadata"].get("classification")
+        }
         
         # Add the response to the conversation
-        state = self.add_message(state, final_response, "assistant")
-        state["current_step"] = "finalize_response"
+        response_content = state["metadata"].get("final_llm_message", "No response generated")
+        state = self.add_message(state, response_content, "assistant")
+        
+        state["metadata"]["formatted_final_response"] = formatted
+        state["current_step"] = "format_final_response"
         
         return state
     
@@ -419,28 +539,22 @@ class TextToSQLFlow(BaseFlow):
         return """
         Text-to-SQL Flow:
         
-        This flow converts natural language requests into SQL queries with comprehensive validation.
+        This flow converts natural language queries into SQL with comprehensive validation.
         
-        Supported operations:
-        1. Generate new SQL from natural language
-        2. Edit existing SQL queries
-        3. Fix SQL syntax errors
-        4. Fix/edit previously returned queries
-        
-        Process steps:
-        1. Analyze request type (new/edit/fix)
-        2. Identify relevant database tables
-        3. Human-in-the-loop validation of table selection
-        4. Identify relevant columns from selected tables
+        Process:
+        1. Classify the request (general vs SQL)
+        2. Rewrite prompt for SQL generation
+        3. Identify relevant database tables
+        4. Human-in-the-loop table approval
         5. Generate SQL query
-        6. Validate SQL syntax and logic
-        7. Human-in-the-loop validation of generated SQL
-        8. Return final SQL with explanation
+        6. Validate SQL correctness
+        7. Execute query and format results
         
         Features:
-        - Human-in-the-loop validation at critical steps
-        - Comprehensive table and column identification
-        - SQL syntax validation
-        - Detailed explanations of table/column selection
-        - Support for complex multi-table queries
+        - Intelligent request classification
+        - Table and column identification
+        - SQL validation and error correction
+        - Human-in-the-loop approval steps
+        - Comprehensive error handling
+        - Detailed reasoning steps
         """ 

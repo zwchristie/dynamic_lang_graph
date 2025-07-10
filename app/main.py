@@ -1,228 +1,270 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Dict, Any, Optional
+from typing import Dict, Any, List, Optional
+from pydantic import BaseModel
 import uuid
-from datetime import datetime
+import logging
 
-from .core.config import settings
-from .models.schemas import (
-    ChatRequest, ChatResponse, ValidationRequest, ValidationResponse,
-    FlowInfo, FlowRegistration
-)
-from .services.orchestrator import OrchestratorService
+from .services.orchestrator import orchestrator_service
+from .services.conversation_manager import conversation_manager, MessageRole
 from .services.flow_registry import FlowRegistryService
+from .core.config import settings
 
-# Create FastAPI app
-app = FastAPI(
-    title=settings.app_name,
-    description="Dynamic agentic workflow system with LangGraph and FastAPI",
-    version="1.0.0"
-)
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title=settings.app_name, debug=settings.debug)
 
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Initialize services
-orchestrator = OrchestratorService()
-flow_registry = FlowRegistryService()
+# Pydantic models for API requests/responses
+class ChatRequest(BaseModel):
+    message: str
+    session_id: Optional[str] = None
+    provider: str = "openai"  # "openai", "bedrock", or "custom"
+    system_prompt: Optional[str] = None
+    clear_context: bool = False
+    max_context_messages: Optional[int] = None
 
-# Session storage (in production, use Redis or database)
-session_storage: Dict[str, Dict[str, Any]] = {}
+class ChatResponse(BaseModel):
+    response: str
+    session_id: str
+    conversation_id: Optional[str] = None
+    provider: str
+    selected_flow: Optional[str] = None
+    planning: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
 
-@app.get("/")
-async def root():
-    """Root endpoint with basic info"""
-    return {
-        "message": "Agentic Workflow System API",
-        "version": "1.0.0",
-        "available_endpoints": [
-            "/api/chat",
-            "/api/flows",
-            "/api/validate",
-            "/docs"
-        ]
-    }
+class FlowRequest(BaseModel):
+    flow_name: str
+    message: str
+    session_id: Optional[str] = None
+    provider: str = "openai"
+    system_prompt: Optional[str] = None
+    clear_context: bool = False
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "flows_count": flow_registry.get_flow_count()
-    }
+class FlowResponse(BaseModel):
+    result: str
+    flow_name: str
+    session_id: str
+    provider: str
+    conversation_id: Optional[str] = None
+    error: Optional[str] = None
 
-@app.post("/api/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
+class ConversationRequest(BaseModel):
+    session_id: str
+    max_messages: Optional[int] = None
+
+class ConversationResponse(BaseModel):
+    session_id: str
+    messages: List[Dict[str, Any]]
+    summary: Dict[str, Any]
+    context_size: Dict[str, Any]
+
+class ClearConversationRequest(BaseModel):
+    session_id: str
+
+class ClearConversationResponse(BaseModel):
+    session_id: str
+    success: bool
+    message: str
+
+class FlowInfoRequest(BaseModel):
+    flow_name: Optional[str] = None
+
+class FlowInfoResponse(BaseModel):
+    flows: List[Dict[str, Any]]
+    total_flows: int
+    categories: Dict[str, int]
+
+# API Endpoints
+
+@app.post("/chat", response_model=ChatResponse)
+async def chat_endpoint(request: ChatRequest):
     """
-    Main chat endpoint for agentic workflows.
-    
-    The orchestrator will automatically determine the appropriate flow
-    based on the user's request and conversation history.
+    Main chat endpoint that determines and executes the appropriate flow
     """
     try:
         # Generate session ID if not provided
         session_id = request.session_id or str(uuid.uuid4())
         
-        # Process the chat request
-        result = orchestrator.process_chat_request(
-            messages=request.messages,
+        # Clear context if requested
+        if request.clear_context:
+            conversation_manager.clear_conversation(session_id)
+        
+        # Execute with planning and provider selection
+        result = orchestrator_service.execute_with_planning(
             session_id=session_id,
-            specified_flow=request.flow_name
+            user_message=request.message,
+            provider=request.provider,
+            system_prompt=request.system_prompt
         )
         
-        # Store session data
-        session_storage[session_id] = {
-            "last_flow": result["flow_name"],
-            "metadata": result.get("metadata", {}),
-            "timestamp": datetime.now().isoformat()
-        }
+        if "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"])
         
         return ChatResponse(
-            response=result["response"],
+            response=result.get("result", result.get("message", "No response generated")),
             session_id=session_id,
-            flow_name=result["flow_name"],
-            metadata=result.get("metadata", {})
+            conversation_id=result.get("conversation_id"),
+            provider=request.provider,
+            selected_flow=result.get("selected_flow"),
+            planning=result.get("planning")
         )
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing chat request: {str(e)}")
+        logger.error(f"Error in chat endpoint: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/flows", response_model=List[FlowInfo])
-async def get_flows():
-    """Get all available flows"""
-    try:
-        return flow_registry.get_all_flows()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving flows: {str(e)}")
-
-@app.get("/api/flows/{flow_name}", response_model=FlowInfo)
-async def get_flow(flow_name: str):
-    """Get information about a specific flow"""
-    try:
-        flow_info = flow_registry.get_flow_by_name(flow_name)
-        if not flow_info:
-            raise HTTPException(status_code=404, detail=f"Flow '{flow_name}' not found")
-        return flow_info
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving flow: {str(e)}")
-
-@app.post("/api/flows/register")
-async def register_flow(registration: FlowRegistration):
-    """Register a new flow dynamically"""
-    try:
-        if not flow_registry.validate_flow_name(registration.name):
-            raise HTTPException(
-                status_code=400, 
-                detail="Invalid flow name. Must be lowercase alphanumeric with underscores."
-            )
-        
-        success = flow_registry.register_flow(registration)
-        if not success:
-            raise HTTPException(
-                status_code=409, 
-                detail=f"Flow '{registration.name}' already exists"
-            )
-        
-        return {
-            "message": f"Flow '{registration.name}' registered successfully",
-            "flow_name": registration.name
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error registering flow: {str(e)}")
-
-@app.get("/api/flows/statistics")
-async def get_flow_statistics():
-    """Get statistics about registered flows"""
-    try:
-        return flow_registry.get_flow_statistics()
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving flow statistics: {str(e)}")
-
-@app.post("/api/validate", response_model=ValidationResponse)
-async def validate_step(request: ValidationRequest):
+@app.post("/flow/{flow_name}", response_model=FlowResponse)
+async def execute_specific_flow(flow_name: str, request: FlowRequest):
     """
-    Human-in-the-loop validation endpoint.
-    
-    This endpoint handles validation requests from flows that require
-    human approval (e.g., table selection, SQL validation).
+    Execute a specific flow with conversation context
     """
     try:
-        session_id = request.session_id
+        # Use session ID from request or generate new one
+        session_id = request.session_id or str(uuid.uuid4())
         
-        # Store validation result in session
-        if session_id not in session_storage:
-            session_storage[session_id] = {}
+        # Clear context if requested
+        if request.clear_context:
+            conversation_manager.clear_conversation(session_id)
         
-        session_storage[session_id]["validation_result"] = {
-            "type": request.validation_type,
-            "approved": request.user_response,
-            "data": request.data,
-            "timestamp": datetime.now().isoformat()
-        }
-        
-        # Update flow state based on validation
-        if request.validation_type == "table_selection":
-            session_storage[session_id]["table_validation_approved"] = request.user_response
-        elif request.validation_type == "query_validation":
-            session_storage[session_id]["sql_validation_approved"] = request.user_response
-        
-        return ValidationResponse(
+        # Execute the specific flow
+        result = orchestrator_service.execute_flow_with_context(
             session_id=session_id,
-            approved=request.user_response,
-            message=f"Validation {'approved' if request.user_response else 'rejected'}"
+            flow_name=flow_name,
+            user_message=request.message,
+            provider=request.provider,
+            system_prompt=request.system_prompt
+        )
+        
+        if "error" in result:
+            raise HTTPException(status_code=400, detail=result["error"])
+        
+        return FlowResponse(
+            result=result.get("result", "No result generated"),
+            flow_name=flow_name,
+            session_id=session_id,
+            provider=request.provider,
+            conversation_id=result.get("conversation_id")
         )
         
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing validation: {str(e)}")
+        logger.error(f"Error executing flow {flow_name}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/sessions/{session_id}")
-async def get_session_info(session_id: str):
-    """Get information about a specific session"""
+@app.get("/flows", response_model=FlowInfoResponse)
+async def get_flows_info(request: FlowInfoRequest = Depends()):
+    """
+    Get information about available flows
+    """
     try:
-        if session_id not in session_storage:
-            raise HTTPException(status_code=404, detail="Session not found")
+        flow_registry = FlowRegistryService()
         
-        return {
-            "session_id": session_id,
-            "data": session_storage[session_id]
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving session: {str(e)}")
-
-@app.delete("/api/sessions/{session_id}")
-async def delete_session(session_id: str):
-    """Delete a session"""
-    try:
-        if session_id in session_storage:
-            del session_storage[session_id]
-            return {"message": f"Session '{session_id}' deleted successfully"}
+        if request.flow_name:
+            # Get specific flow info
+            flow_info = flow_registry.get_flow_by_name(request.flow_name)
+            flows = [flow_info.dict()] if flow_info else []
         else:
-            raise HTTPException(status_code=404, detail="Session not found")
-    except HTTPException:
-        raise
+            # Get all flows info
+            flows = [flow.dict() for flow in flow_registry.get_all_flows()]
+        
+        stats = flow_registry.get_flow_statistics()
+        
+        return FlowInfoResponse(
+            flows=flows,
+            total_flows=stats["total_flows"],
+            categories=stats["categories"]
+        )
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error deleting session: {str(e)}")
+        logger.error(f"Error getting flows info: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/api/orchestrator/flows")
-async def get_orchestrator_flows():
-    """Get the orchestrator's view of available flows"""
+@app.post("/conversation/context", response_model=ConversationResponse)
+async def get_conversation_context(request: ConversationRequest):
+    """
+    Get conversation context for a session
+    """
     try:
-        return orchestrator.get_flow_info()
+        conversation = conversation_manager.get_conversation(request.session_id)
+        if not conversation:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        
+        messages = conversation_manager.get_conversation_messages(
+            request.session_id, 
+            request.max_messages
+        )
+        
+        summary = conversation_manager.get_conversation_summary(request.session_id)
+        
+        return ConversationResponse(
+            session_id=request.session_id,
+            messages=[msg.to_dict() for msg in messages],
+            summary=summary,
+            context_size={"message_count": len(messages), "estimated_tokens": len(messages) * 100}
+        )
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error retrieving orchestrator flows: {str(e)}")
+        logger.error(f"Error getting conversation context: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/conversation/clear", response_model=ClearConversationResponse)
+async def clear_conversation(request: ClearConversationRequest):
+    """
+    Clear conversation context for a session
+    """
+    try:
+        success = conversation_manager.clear_conversation(request.session_id)
+        
+        return ClearConversationResponse(
+            session_id=request.session_id,
+            success=success,
+            message="Conversation cleared successfully" if success else "Failed to clear conversation"
+        )
+        
+    except Exception as e:
+        logger.error(f"Error clearing conversation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/health")
+async def health_check():
+    """
+    Health check endpoint
+    """
+    return {
+        "status": "healthy",
+        "app_name": settings.app_name,
+        "provider": settings.provider,
+        "debug": settings.debug
+    }
+
+@app.get("/")
+async def root():
+    """
+    Root endpoint with API information
+    """
+    return {
+        "message": f"Welcome to {settings.app_name}",
+        "version": "1.0.0",
+        "endpoints": {
+            "chat": "/chat",
+            "flow": "/flow/{flow_name}",
+            "flows": "/flows",
+            "conversation": "/conversation/context",
+            "clear_conversation": "/conversation/clear",
+            "health": "/health"
+        },
+        "supported_providers": ["openai", "bedrock", "custom"]
+    }
 
 if __name__ == "__main__":
     import uvicorn
