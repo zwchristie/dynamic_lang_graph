@@ -105,12 +105,7 @@ class LLMApi:
         print(f'GENERATING NEW TOKEN ... ')
         token_url = "https://idag2.jpmorganchase.com/adfs/oauth2/token"
         data = {
-            "client_id": "PC-111172-SID-248571-PROD",
-            "resource": "JPMC:URI:RS-111172-136196-LLMSUITE-PROD",
-            "grant_type": "password",
-            "username": "AD\\V763752",
-            "password": "PrimaryOne05072026!",
-            "scope": "user_impersonation"
+            
         }
 
         res = requests.post(token_url, data=data)
